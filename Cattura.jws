@@ -1,0 +1,565 @@
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.Stack;
+
+import org.apache.axis.AxisFault;
+import org.apache.axis.Constants;
+import org.apache.axis.MessageContext;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.sakaiproject.announcement.api.AnnouncementService;
+import org.sakaiproject.authz.api.AuthzGroup;
+import org.sakaiproject.authz.api.AuthzGroupService;
+import org.sakaiproject.authz.api.Member;
+import org.sakaiproject.authz.api.Role;
+import org.sakaiproject.authz.api.SecurityService;
+import org.sakaiproject.calendar.api.Calendar;
+import org.sakaiproject.calendar.api.CalendarEdit;
+import org.sakaiproject.calendar.api.CalendarEvent;
+import org.sakaiproject.calendar.api.CalendarEventEdit;
+import org.sakaiproject.calendar.api.CalendarService;
+import org.sakaiproject.calendar.api.RecurrenceRule;
+import org.sakaiproject.component.api.ServerConfigurationService;
+import org.sakaiproject.component.cover.ComponentManager;
+import org.sakaiproject.content.api.ContentHostingService;
+import org.sakaiproject.entity.api.EntityManager;
+import org.sakaiproject.entity.api.EntityProducer;
+import org.sakaiproject.entity.api.EntityTransferrer;
+import org.sakaiproject.entity.api.ResourceProperties;
+import org.sakaiproject.entity.api.ResourcePropertiesEdit;
+import org.sakaiproject.event.api.EventTrackingService;
+import org.sakaiproject.event.api.UsageSession;
+import org.sakaiproject.event.api.UsageSessionService;
+import org.sakaiproject.exception.IdUnusedException;
+import org.sakaiproject.site.api.Group;
+import org.sakaiproject.site.api.Site;
+import org.sakaiproject.site.api.SitePage;
+import org.sakaiproject.site.api.SiteService;
+import org.sakaiproject.site.api.SiteService.SelectionType;
+import org.sakaiproject.site.api.SiteService.SortType;
+import org.sakaiproject.site.api.ToolConfiguration;
+import org.sakaiproject.tool.api.Session;
+import org.sakaiproject.tool.api.SessionManager;
+import org.sakaiproject.tool.api.Tool;
+import org.sakaiproject.tool.api.ToolManager;
+import org.sakaiproject.user.api.User;
+import org.sakaiproject.user.api.UserDirectoryService;
+import org.sakaiproject.user.api.UserEdit;
+import org.sakaiproject.util.ArrayUtil;
+import org.sakaiproject.util.FormattedText;
+import org.sakaiproject.util.Xml;
+import org.sakaiproject.time.api.TimeRange;
+import org.sakaiproject.time.api.Time;
+import org.sakaiproject.time.cover.TimeService;
+import org.w3c.dom.Attr;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+
+public class Cattura
+{
+
+
+private static final Log LOG = LogFactory.getLog(Cattura.class);
+
+private static final String SESSION_ATTR_NAME_ORIGIN = "origin";
+private static final String SESSION_ATTR_VALUE_ORIGIN_WS = "sakai-axis";
+
+private AnnouncementService announcementService;
+private AuthzGroupService authzGroupService;
+private CalendarService calendarService;
+private EventTrackingService eventTrackingService;
+private SecurityService securityService;
+private ServerConfigurationService serverConfigurationService;
+private SessionManager sessionManager;
+private SiteService siteService;
+private ToolManager toolManager;
+private UsageSessionService usageSessionService;
+private UserDirectoryService userDirectoryService;
+private ContentHostingService contentHostingService;
+private EntityManager entityManager;
+
+public Cattura()
+{
+    announcementService = (AnnouncementService) ComponentManager.get(AnnouncementService.class.getName());
+    authzGroupService = (AuthzGroupService) ComponentManager.get(AuthzGroupService.class.getName());
+    calendarService = (CalendarService) ComponentManager.get(CalendarService.class.getName());
+    eventTrackingService = (EventTrackingService) ComponentManager.get(EventTrackingService.class.getName());
+    securityService = (SecurityService) ComponentManager.get(SecurityService.class.getName());
+    serverConfigurationService = (ServerConfigurationService) ComponentManager.get(ServerConfigurationService.class.getName());
+    sessionManager = (SessionManager) ComponentManager.get(SessionManager.class.getName());
+    siteService = (SiteService) ComponentManager.get(SiteService.class.getName());
+    toolManager = (ToolManager) ComponentManager.get(ToolManager.class.getName());
+    usageSessionService = (UsageSessionService) ComponentManager.get(UsageSessionService.class.getName());
+    userDirectoryService = (UserDirectoryService) ComponentManager.get(UserDirectoryService.class.getName());
+    contentHostingService = (ContentHostingService) ComponentManager.get(ContentHostingService.class.getName());
+    entityManager = (EntityManager) ComponentManager.get(EntityManager.class.getName());
+}
+
+/**
+ * Gets a full list of all events associated to the user.
+ * @param sessionid The oid of the user's session.
+ * @return An XML structure containing the event list.
+ */
+public String getUserEvents(String sessionid) throws AxisFault
+{
+    return getUserEvents(sessionid, null, null);
+}
+
+/**
+ * Gets a list of user events sorted by the provided field value pair.
+ * @param sessionid The id of the user's session.
+ * @param field The field to be searched. Null will not filter at all.
+ * @param value The value of the field required to be filtered. Null will not be filtered at all.
+ * @return An XML structure containing the event list.
+ */
+public String getUserEvents(String sessionid, String field, String value) throws AxisFault
+{
+    Session s = establishSession(sessionid);
+    List<Site> sites = getAllSitesForUser(s);
+
+    if(sites == null)
+    {
+        return "<events/>";
+    }
+
+    Document dom = Xml.createDocument();
+    Node root = dom.createElement("events");
+    dom.appendChild(root);
+
+    for(Site site : sites)
+    {
+        try
+        {
+            Calendar c = calendarService.getCalendar("/calendar/calendar/"+site.getId()+"/main");
+            List<CalendarEvent> events = c.getEvents(null, null);
+            for(CalendarEvent e : events)
+            {
+                if(isCaptureEvent(e, field, value))
+                {
+                    root.appendChild(eventToXml(dom, site, e));
+                }
+            }
+        }
+        catch(Exception e)
+        {
+            LOG.warn("Cattura getUserEvents(): Error while getting site - " + e.toString());
+        }
+    }
+
+    return Xml.writeDocumentToString(dom);
+}
+
+/**
+ * Gets the final full data set consisting of the given users and events.
+ * @param sessionid The id of the user's session.
+ * @param uids The comma separated list of user ids to fetch.
+ * @param eids The comma separated list of event ids to fetch.
+ * @return An XML structure containing the data set.
+ */
+public String getDataSet(String sessionid, String uids, String eids) throws AxisFault
+{
+    Session s = establishSession(sessionid);
+
+    List<String> users = Arrays.asList(uids.split(","));
+    List<String> events = Arrays.asList(eids.split(","));
+
+    Document dom = Xml.createDocument();
+    Node root = dom.createElement("dataset");
+    Node user_root = dom.createElement("users");
+    Node event_root = dom.createElement("events");
+    root.appendChild(user_root);
+    root.appendChild(event_root);
+    dom.appendChild(root);
+
+    for(String user : users)
+    {
+        Session user_sess = getSessionForUser(s, user, true);
+        try
+        {
+            user_root.appendChild(userToXml(dom, userDirectoryService.getUserByEid(user)));
+        }
+        catch(Exception e)
+        {
+            LOG.warn(e.toString());
+        }
+
+        List<Site> sites = getAllSitesForUser(user_sess);
+        if(sites == null)
+        {
+            continue;
+        }
+
+        for(Site site : sites)
+        {
+            try
+            {
+                Calendar c = calendarService.getCalendar("/calendar/calendar/"+site.getId()+"/main");
+                List<CalendarEvent> cal_events = c.getEvents(null, null);
+                for(CalendarEvent e : cal_events)
+                {
+                    if(events.contains(e.getId()))
+                    {
+                        event_root.appendChild(eventToXml(dom, site, e));
+                    }
+                }
+            }
+            catch(Exception e)
+            {
+                LOG.warn("Cattura getUserEvents(): Error while getting site - " + e.toString());
+            }
+        }
+    }
+
+    return Xml.writeDocumentToString(dom);
+}
+
+/**
+ * Determines if a capture event has the necessary flags to be a real capture event.
+ * @param e The event to check.
+ * @return True if the event is valid, false if not.
+ */
+private boolean isCaptureEvent(CalendarEvent e, String field, String value)
+{
+    if(field == null || value == null)
+    {
+        return true;
+    }
+
+    return e.getField(field).equalsIgnoreCase(value);
+}
+
+/**
+ * Convert an event object to XML.
+ * @param dom The document in use.
+ * @param site The site the event is based off of.
+ * @param e The event to parse.
+ * @return A node object with the object data.
+ */
+private Node eventToXml(Document dom, Site site, CalendarEvent e)
+{
+    //Build up the name, description, and capture nodes.
+    Node id = dom.createElement("id");
+    id.appendChild(dom.createTextNode(e.getId()));
+    Node name = dom.createElement("name");
+    name.appendChild(dom.createTextNode(e.getDisplayName()));
+    Node description = dom.createElement("description");
+    description.appendChild(dom.createTextNode(e.getDescription()));
+
+    //Capture the time range (GMT).
+    TimeRange tr = e.getRange();
+    Node start = dom.createElement("start");
+    start.appendChild(dom.createTextNode(Long.toString(tr.firstTime().getTime())));
+    Node end = dom.createElement("end");
+    end.appendChild(dom.createTextNode(Long.toString(tr.lastTime().getTime())));
+    Node duration = dom.createElement("duration");
+    duration.appendChild(dom.createTextNode(Long.toString(tr.duration())));
+
+    //Capture other metadata associated with the event.
+    Node location = dom.createElement("location");
+    location.appendChild(dom.createTextNode(e.getLocation()));
+    Node siteNode = dom.createElement("site");
+    siteNode.appendChild(dom.createTextNode(site.getTitle()));
+    Node siteId = dom.createElement("siteId");
+    siteId.appendChild(dom.createTextNode(site.getId()));
+
+    //Build up the recurrence rule.
+    RecurrenceRule rr = e.getRecurrenceRule();
+    Node count = dom.createElement("count");
+    Node until = dom.createElement("until");
+    Node frequency = dom.createElement("frequency");
+    if(rr != null)
+    {
+        frequency.appendChild(dom.createTextNode(rr.getFrequency()));
+        count.appendChild(dom.createTextNode(Integer.toString(rr.getCount())));
+
+        if(rr.getUntil() != null)
+        {
+            until.appendChild(dom.createTextNode(Long.toString(rr.getUntil().getTime())));
+        }
+        else
+        {
+            until.appendChild(dom.createTextNode(Long.toString(tr.firstTime().getTime())));
+        }
+    }
+    else
+    {
+        frequency.appendChild(dom.createTextNode("once"));
+        until.appendChild(dom.createTextNode(Long.toString(tr.firstTime().getTime())));
+        count.appendChild(dom.createTextNode("1"));
+    }
+
+    Node event = dom.createElement("event");
+    event.appendChild(id);
+    event.appendChild(frequency);
+    event.appendChild(until);
+    event.appendChild(count);
+    event.appendChild(name);
+    event.appendChild(description);
+    event.appendChild(start);
+    event.appendChild(end);
+    event.appendChild(duration);
+    event.appendChild(location);
+    event.appendChild(siteNode);
+    event.appendChild(siteId);
+
+    return event;
+}
+
+/**
+ * Gets a directory of the users within the entire Sakai system and places it in an xml data structure.
+ *
+ * @param sessionid The id of the session to use.
+ * @return XML containing the users in the system.
+ * @throws AxisFault Should there be an issue with the existing session this will be thrown.
+ */
+public String getUserDirectory(String sessionid) throws AxisFault
+{
+    Session s = establishSession(sessionid);
+
+    if(!securityService.isSuperUser(s.getUserId()))
+    {
+        return "<users />";
+    }
+
+    List<User> users = userDirectoryService.getUsers();
+    Document dom = Xml.createDocument();
+    Node root = dom.createElement("users");
+    dom.appendChild(root);
+
+    for(User user : users)
+    {
+        root.appendChild(userToXml(dom, user, "user", true));
+    }
+
+    return Xml.writeDocumentToString(dom);
+}
+
+/**
+ * Converts a user to XML, only providing a default root node name.
+ *
+ * @param dom The dom document to base elements off of.
+ * @param user The user to convert to XML.
+ * @return A string containing XML information about the user. The root node is named "user".
+ * @throws AxisFault Exception related to permissions.
+ */
+private Node userToXml(Document dom, User user) throws AxisFault
+{
+    return userToXml(dom, user, "user", false);
+}
+
+/**
+ * Converts a user to XML, with the provided node name being the name of the root node.
+ *
+ * @param dom The dom document to base elements off of.
+ * @param user The user to convert to XML.
+ * @param nodeName The name of the root node.
+ * @param small Return a limited, trimmed result.
+ * @return A string containing XML information about the user.
+ * @throws AxisFault Exception related to permissions.
+ */
+private Node userToXml(Document dom, User user, String nodeName, boolean small) throws AxisFault
+{
+    Element userNode = dom.createElement(nodeName);
+
+    Node id = dom.createElement("id");
+    id.appendChild(dom.createTextNode(user.getEid()));
+    userNode.appendChild(id);
+
+    Node firstName = dom.createElement("firstname");
+    firstName.appendChild(dom.createTextNode(user.getFirstName()));
+    userNode.appendChild(firstName);
+
+    Node lastName = dom.createElement("lastname");
+    lastName.appendChild(dom.createTextNode(user.getLastName()));
+    userNode.appendChild(lastName);
+
+    if(!small)
+    {
+        Node type = dom.createElement("type");
+        type.appendChild(dom.createTextNode(user.getType()));
+        userNode.appendChild(type);
+
+        Node created = dom.createElement("created");
+        created.appendChild(dom.createTextNode(Long.toString(user.getCreatedTime().getTime())));
+        userNode.appendChild(created);
+
+        Node modified = dom.createElement("modified");
+        modified.appendChild(dom.createTextNode(Long.toString(user.getModifiedTime().getTime())));
+        userNode.appendChild(modified);
+
+        Node email = dom.createElement("email");
+        email.appendChild(dom.createTextNode(user.getEmail()));
+        userNode.appendChild(email);
+    }
+
+    return userNode;
+}
+
+/**
+ * Gets a list of all of the sites that the user has been added to.
+ *
+ * @param s The sesssion that has already been established.
+ * @return A list containing the sites the user has been added to.
+ * @throws AxisFault If the session is inative the function will be rejected.
+ */
+private List<Site> getAllSitesForUser(Session s) throws AxisFault
+{
+    try
+    {
+        List<Site> allSites = siteService.getSites(SelectionType.ACCESS, null, null,null, SortType.TITLE_ASC, null);
+        List<Site> moreSites = siteService.getSites(SelectionType.UPDATE, null, null,null, SortType.TITLE_ASC, null);
+
+        //Remove duplicates and combine
+        allSites.removeAll(moreSites);
+        allSites.addAll(moreSites);
+
+        try
+        {
+            Site myWorkspace = siteService.getSiteVisit(siteService.getUserSiteId(s.getUserId()));
+            allSites.add(myWorkspace);
+        }
+        catch (Exception e)
+        {
+            LOG.warn("Cattura getAllSitesForUser(): Error grabbing user workspace - " + e.toString());
+        }
+
+        return allSites;
+    }
+    catch (Exception e)
+    {
+        LOG.error("Cattura getAllSitesForUser(): Error getting all sites for user - " + e.toString());
+        return null;
+    }
+}
+
+/**
+ * Get the Session related to the given sessionid.
+ *
+ * @param sessionid the id of the session to retrieve
+ * @return the session, if it is active
+ * @throws AxisFault if session is inactive
+ */
+private Session establishSession(String sessionid) throws AxisFault
+{
+    Session s = sessionManager.getSession(sessionid);
+
+    if (s == null)
+    {
+        throw new AxisFault("Session \""+sessionid+"\" is not active");
+    }
+    s.setActive();
+    sessionManager.setCurrentSession(s);
+    return s;
+}
+
+/**
+ * Creates and returns the session ID for a given user.
+ *
+ * The sessionid argument must be a valid session for a super user ONLY otherwise it will fail.
+ * The userid argument must be the EID (ie jsmith) of a valid user.
+ * This new sessionid can then be used with getSitesUserCanAccess() to get the sites for the given user.
+ *
+ * @param   sessionid   the sessionid of a valid session for a super user
+ * @param   eid         the eid of the user you want to create a session for
+ * @param   wsonly      should the session created be ties to the web services only?
+ *                      the initial implementation of this will just set an attribute on the Session that identifies it as originating from the web services.
+ *                      but in essence it will be just like a normal session. However this attribute is used elsewhere for filtering for these web service sessions.
+ * @return              the sessionid for the user specified
+ * @throws  AxisFault   if any data is missing,
+ *                      not super user,
+ *                      or session cannot be established
+ */
+private Session getSessionForUser(Session session, String eid, boolean wsonly) throws AxisFault
+{
+    //check that ONLY super users are accessing this
+    if(!securityService.isSuperUser(session.getUserId()))
+    {
+        LOG.warn("WS getSessionForUser(): Permission denied. Restricted to super users.");
+        throw new AxisFault("WS getSessionForUser(): Permission denied. Restricted to super users.");
+    }
+
+    try
+    {
+        //check for empty userid
+        if (StringUtils.isBlank(eid))
+        {
+            LOG.warn("WS getSessionForUser() failed. Param eid empty.");
+            throw new AxisFault("WS failed. Param eid empty.");
+        }
+
+        //if dealing with web service sessions, re-use is ok
+        if(wsonly)
+        {
+            //do we already have a web service session for the given user? If so, reuse it.
+            List<Session> existingSessions = sessionManager.getSessions();
+            for(Session existingSession: existingSessions)
+            {
+                if(StringUtils.equals(existingSession.getUserEid(), eid))
+                {
+                    //check if the origin attribute, if set, is set for web services
+                    String origin = (String)existingSession.getAttribute(SESSION_ATTR_NAME_ORIGIN);
+                    if(StringUtils.equals(origin, SESSION_ATTR_VALUE_ORIGIN_WS))
+                    {
+                        LOG.warn("WS getSessionForUser() reusing existing session for: " + eid + ", session=" + existingSession.getId());
+                        return existingSession;
+                    }
+                }
+            }
+        }
+
+        //get ip address for establishing session
+        MessageContext messageContext = MessageContext.getCurrentContext();
+        String ipAddress = messageContext.getStrProp(Constants.MC_REMOTE_ADDR);
+
+        //start a new session
+        Session newsession = sessionManager.startSession();
+        sessionManager.setCurrentSession(newsession);
+
+        //inject this session with new user values
+        User user = userDirectoryService.getUserByEid(eid);
+        newsession.setUserEid(eid);
+        newsession.setUserId(user.getId());
+
+        //if wsonly, inject the origin attribute
+        if(wsonly)
+        {
+            newsession.setAttribute(SESSION_ATTR_NAME_ORIGIN, SESSION_ATTR_VALUE_ORIGIN_WS);
+            LOG.warn("WS getSessionForUser() set origin attribute on session: " + newsession.getId());
+        }
+
+        //register the session with presence
+        UsageSession usagesession = usageSessionService.startSession(user.getId(),ipAddress,"SakaiScript.jws getSessionForUser()");
+
+        // update the user's externally provided realm definitions
+        authzGroupService.refreshUser(user.getId());
+
+        // post the login event
+        eventTrackingService.post(eventTrackingService.newEvent("user.login", null, true));
+
+        if (newsession == null)
+        {
+            LOG.warn("WS getSessionForUser() failed. Unable to establish session for userid=" + eid + ", ipAddress=" + ipAddress);
+            throw new AxisFault("WS failed. Unable to establish session");
+        }
+        else
+        {
+            LOG.warn("WS getSessionForUser() OK. Established session for userid=" + eid + ", session=" + newsession.getId() + ", ipAddress=" + ipAddress);
+            return newsession;
+        }
+    }
+    catch (Exception e)
+    {
+        LOG.warn(e.getClass().getName() + " : " + e.getMessage());
+        throw new AxisFault("WS failed. Unable to establish session");
+    }
+}
+
+
+}
